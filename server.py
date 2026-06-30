@@ -17,9 +17,9 @@ from mcp.server.fastmcp import FastMCP
 
 HERE = Path(__file__).parent
 DB_PATH = os.environ.get("MEMORY_DB", str(HERE / "memory.db"))
-MODEL = os.environ.get("MEMORY_MODEL", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
+MODEL = os.environ.get("MEMORY_MODEL", "intfloat/multilingual-e5-large")
 PORT = int(os.environ.get("MEMORY_PORT", "8077"))
-DIM = int(os.environ.get("MEMORY_DIM", "768"))
+DIM = int(os.environ.get("MEMORY_DIM", "1024"))
 
 _embedder = None
 _lock = threading.Lock()
