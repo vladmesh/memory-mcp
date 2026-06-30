@@ -1,0 +1,5 @@
+# Direct deps; fastembed pulls onnxruntime, tokenizers, huggingface_hub, mmh3.
+mcp==1.28.1
+fastembed==0.8.0
+sqlite-vec==0.1.9
+numpy==2.4.6

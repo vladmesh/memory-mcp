@@ -6,8 +6,8 @@ After=network.target
 Type=simple
 User=dev
 Group=dev
-WorkingDirectory=/home/dev/control-panel/services/memory-mcp
-ExecStart=/home/dev/control-panel/services/memory-mcp/run.sh
+WorkingDirectory=/home/dev/memory-mcp
+ExecStart=/home/dev/memory-mcp/run.sh
 Restart=always
 RestartSec=3
 
