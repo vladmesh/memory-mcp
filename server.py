@@ -110,14 +110,8 @@ def search_memory(query: str, k: int = 5) -> list:
 
 mcp = FastMCP("memory", host="127.0.0.1", port=PORT)
 
-
-@mcp.tool()
-def memory_add(text: str, tags: str = "", source: str = "") -> dict:
-    """Store a fact/note in shared long-term memory for later semantic recall.
-    text: the content to remember. tags: optional comma-separated labels.
-    source: optional origin (e.g. which agent/project wrote it)."""
-    rid = add_memory(text, tags or None, source or None)
-    return {"id": rid, "stored": True}
+# Память read-only для агентов: пишет только куратор (markdown-канон → reindex).
+# Внутренний add_memory оставлен для миграции/selftest, но через MCP не светится.
 
 
 @mcp.tool()
