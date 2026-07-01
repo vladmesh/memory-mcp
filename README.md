@@ -39,6 +39,7 @@ claude mcp add --scope user --transport http panelmem http://127.0.0.1:8077/mcp
 | `MEMORY_MODEL` | `intfloat/multilingual-e5-large` | fastembed model id |
 | `MEMORY_DIM` | `1024` | must match the model |
 | `MEMORY_PORT` | `8077` | HTTP port |
+| `MEMORY_SEARCH_LOG` | `<db dir>/search-log.jsonl` | append-only jsonl log of every `memory_search` call |
 
 Changing the model means re-embedding: stop the daemon, set `MEMORY_MODEL`/`MEMORY_DIM`, run `python reindex.py`, start again.
 

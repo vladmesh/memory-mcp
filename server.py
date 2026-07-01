@@ -4,6 +4,7 @@ SQLite + sqlite-vec for storage/ANN, fastembed (bge-m3, multilingual) for embedd
 exposed over streamable-HTTP so Claude / Codex / Hermes all share ONE warm instance.
 """
 
+import json
 import os
 import sqlite3
 import datetime
@@ -22,6 +23,7 @@ DB_PATH = os.environ.get("MEMORY_DB", str(HERE / "memory.db"))
 MODEL = os.environ.get("MEMORY_MODEL", "intfloat/multilingual-e5-large")
 PORT = int(os.environ.get("MEMORY_PORT", "8077"))
 DIM = int(os.environ.get("MEMORY_DIM", "1024"))
+SEARCH_LOG = os.environ.get("MEMORY_SEARCH_LOG", str(Path(DB_PATH).parent / "search-log.jsonl"))
 
 # Markdown canon (panelmem-kb) is source of truth; this index is derived. The daemon
 # owns the sqlite file, so the daemon rebuilds the index in-process — no stop/start,
@@ -33,6 +35,7 @@ WATCH_INTERVAL = float(os.environ.get("MEMORY_WATCH_INTERVAL", "10"))
 _embedder = None
 _lock = threading.Lock()
 _reindex_lock = threading.Lock()
+_search_log_lock = threading.Lock()  # own lock: don't couple log I/O to embedder/reindex locks
 
 
 def embedder() -> TextEmbedding:
@@ -119,6 +122,27 @@ def search_memory(query: str, k: int = 5) -> list:
         }
         for r in rows
     ]
+
+
+def log_search(query: str, k: int, results: list) -> None:
+    """Append one jsonl line per memory_search call. Best-effort telemetry:
+    any failure here is swallowed — logging must never break the search."""
+    try:
+        line = json.dumps(
+            {
+                "ts": datetime.datetime.utcnow().isoformat(),
+                "query": query,
+                "k": k,
+                "hits": [{"id": r["id"], "score": r["score"]} for r in results],
+            },
+            ensure_ascii=False,
+        )
+        with _search_log_lock:  # one write per line so concurrent calls don't interleave
+            with open(SEARCH_LOG, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+    except Exception:
+        pass
 
 
 # ── Canon → index (daemon-owned reindex) ──────────────────────────────────────
@@ -222,7 +246,9 @@ mcp = FastMCP("memory", host="127.0.0.1", port=PORT)
 @mcp.tool()
 def memory_search(query: str, k: int = 5) -> list:
     """Semantic search over shared memory. Returns up to k closest entries with scores."""
-    return search_memory(query, k)
+    results = search_memory(query, k)
+    log_search(query, k, results)  # tool-level: capture real agent queries, not internal calls
+    return results
 
 
 @mcp.tool()
