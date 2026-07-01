@@ -51,3 +51,6 @@ Changing the model means re-embedding: stop the daemon, set `MEMORY_MODEL`/`MEMO
 
 - `sqlite-vec` KNN needs `WHERE embedding MATCH ? AND k = ?`, not a `LIMIT` after a JOIN.
 - The markdown canon is the source of truth; this DB is a derived index and can be rebuilt from it with `reindex.py`.
+- **systemd `203/EXEC`:** `run.sh` needs the exec bit (`chmod +x`), else the unit fails on start.
+- **onnxruntime 1.27 + HF symlink cache:** fails with `External data path escapes model directory`. Download the model once with `HF_HUB_DISABLE_SYMLINKS=1 HF_HUB_DISABLE_SYMLINKS_DOWNLOAD=1` (real file copies) before starting the daemon.
+- **fastembed 0.8.0** switched e5-large to mean-pooling (was CLS) — harmless warning at load, search stays consistent (index and query use the same model). To restore old behaviour, pin `fastembed==0.5.1` or use `add_custom_model`.
