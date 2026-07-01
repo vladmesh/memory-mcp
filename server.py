@@ -60,7 +60,7 @@ def init_db() -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS memories("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
-        "tags TEXT, source TEXT, created_at TEXT)"
+        "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
     )
     conn.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{DIM}])"
@@ -88,7 +88,7 @@ def add_memory(text: str, tags=None, source=None) -> int:
 def search_memory(query: str, k: int = 5) -> list:
     conn = db()
     rows = conn.execute(
-        "SELECT v.rowid, v.distance, m.text, m.tags, m.source, m.created_at "
+        "SELECT v.rowid, v.distance, m.text, m.scope, m.tags, m.source, m.created_at "
         "FROM vec_memories v JOIN memories m ON m.id = v.rowid "
         "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
         (sqlite_vec.serialize_float32(embed_query(query).tolist()), k),
@@ -100,9 +100,10 @@ def search_memory(query: str, k: int = 5) -> list:
             "id": r[0],
             "score": round(1 - (r[1] ** 2) / 2, 4),
             "text": r[2],
-            "tags": r[3],
-            "source": r[4],
-            "created_at": r[5],
+            "scope": r[3],
+            "tags": r[4],
+            "source": r[5],
+            "created_at": r[6],
         }
         for r in rows
     ]
@@ -125,12 +126,12 @@ def memory_get(id: int) -> dict:
     """Fetch one memory entry by id."""
     conn = db()
     r = conn.execute(
-        "SELECT id, text, tags, source, created_at FROM memories WHERE id = ?", (id,)
+        "SELECT id, text, scope, tags, source, created_at FROM memories WHERE id = ?", (id,)
     ).fetchone()
     conn.close()
     if not r:
         return {"error": "not found", "id": id}
-    return {"id": r[0], "text": r[1], "tags": r[2], "source": r[3], "created_at": r[4]}
+    return {"id": r[0], "text": r[1], "scope": r[2], "tags": r[3], "source": r[4], "created_at": r[5]}
 
 
 @mcp.tool()
@@ -138,12 +139,12 @@ def memory_list(limit: int = 50) -> list:
     """List recent memory entries (newest first)."""
     conn = db()
     rows = conn.execute(
-        "SELECT id, text, tags, source, created_at FROM memories ORDER BY id DESC LIMIT ?",
+        "SELECT id, text, scope, tags, source, created_at FROM memories ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
     conn.close()
     return [
-        {"id": r[0], "text": r[1], "tags": r[2], "source": r[3], "created_at": r[4]}
+        {"id": r[0], "text": r[1], "scope": r[2], "tags": r[3], "source": r[4], "created_at": r[5]}
         for r in rows
     ]
 
