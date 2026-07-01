@@ -8,10 +8,12 @@ import os
 import sqlite3
 import datetime
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 import sqlite_vec
+import yaml
 from fastembed import TextEmbedding
 from mcp.server.fastmcp import FastMCP
 
@@ -21,8 +23,16 @@ MODEL = os.environ.get("MEMORY_MODEL", "intfloat/multilingual-e5-large")
 PORT = int(os.environ.get("MEMORY_PORT", "8077"))
 DIM = int(os.environ.get("MEMORY_DIM", "1024"))
 
+# Markdown canon (panelmem-kb) is source of truth; this index is derived. The daemon
+# owns the sqlite file, so the daemon rebuilds the index in-process — no stop/start,
+# no second writer. A watcher thread repolls the canon and rebuilds on change.
+KB = Path(os.environ.get("PANELMEM_KB", str(Path.home() / "panelmem-kb")))
+CANON = KB / "memory"
+WATCH_INTERVAL = float(os.environ.get("MEMORY_WATCH_INTERVAL", "10"))
+
 _embedder = None
 _lock = threading.Lock()
+_reindex_lock = threading.Lock()
 
 
 def embedder() -> TextEmbedding:
@@ -86,14 +96,16 @@ def add_memory(text: str, tags=None, source=None) -> int:
 
 
 def search_memory(query: str, k: int = 5) -> list:
-    conn = db()
-    rows = conn.execute(
-        "SELECT v.rowid, v.distance, m.text, m.scope, m.tags, m.source, m.created_at "
-        "FROM vec_memories v JOIN memories m ON m.id = v.rowid "
-        "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
-        (sqlite_vec.serialize_float32(embed_query(query).tolist()), k),
-    ).fetchall()
-    conn.close()
+    qvec = sqlite_vec.serialize_float32(embed_query(query).tolist())
+    with _reindex_lock:  # don't read while a rebuild is swapping tables
+        conn = db()
+        rows = conn.execute(
+            "SELECT v.rowid, v.distance, m.text, m.scope, m.tags, m.source, m.created_at "
+            "FROM vec_memories v JOIN memories m ON m.id = v.rowid "
+            "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
+            (qvec, k),
+        ).fetchall()
+        conn.close()
     # unit vectors → L2 distance d relates to cosine: cos = 1 - d^2/2
     return [
         {
@@ -107,6 +119,98 @@ def search_memory(query: str, k: int = 5) -> list:
         }
         for r in rows
     ]
+
+
+# ── Canon → index (daemon-owned reindex) ──────────────────────────────────────
+# Kept in sync with reindex.py's parsing; reindex.py is the manual fallback and
+# reuses these functions.
+
+
+def scope_for(path: Path) -> str:
+    top = path.relative_to(CANON).parts[0]
+    return "global" if top == "global" else f"project:{top}"
+
+
+def parse_fact(path: Path) -> dict:
+    raw = path.read_text(encoding="utf-8")
+    meta, body = {}, raw
+    if raw.startswith("---"):
+        _, front, body = raw.split("---", 2)
+        meta = yaml.safe_load(front) or {}
+    tags = meta.get("tags")
+    return {
+        "scope": scope_for(path),
+        "text": body.strip(),
+        "tags": ",".join(tags) if tags else None,
+        "source": meta.get("source"),
+        "created_at": str(meta["created"]) if meta.get("created") else None,
+    }
+
+
+def load_canon() -> list:
+    if not CANON.is_dir():
+        return []
+    return [parse_fact(md) for md in sorted(CANON.rglob("*.md"))]
+
+
+def canon_signature() -> tuple:
+    """Cheap change token: (file count, max mtime, total size). Catches add/edit/delete."""
+    if not CANON.is_dir():
+        return (0, 0.0, 0)
+    count = mtime = size = 0
+    for md in CANON.rglob("*.md"):
+        st = md.stat()
+        count += 1
+        mtime = max(mtime, st.st_mtime)
+        size += st.st_size
+    return (count, mtime, size)
+
+
+def rebuild_index() -> int:
+    """Rebuild memories + vec_memories from the canon. Embeds outside the lock; only the
+    drop/create/insert runs under _reindex_lock so searches see a brief, consistent swap."""
+    facts = load_canon()
+    rows = [(f, embed_doc(f["text"])) for f in facts]  # slow part, no lock held
+    with _reindex_lock:
+        conn = db()
+        conn.execute("DROP TABLE IF EXISTS memories")
+        conn.execute("DROP TABLE IF EXISTS vec_memories")
+        conn.execute(
+            "CREATE TABLE memories("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
+            "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
+        )
+        conn.execute(f"CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[{DIM}])")
+        for f, vec in rows:
+            cur = conn.execute(
+                "INSERT INTO memories(text, scope, tags, source, created_at) VALUES (?,?,?,?,?)",
+                (f["text"], f["scope"], f["tags"], f["source"], f["created_at"]),
+            )
+            conn.execute(
+                "INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)",
+                (cur.lastrowid, sqlite_vec.serialize_float32(vec.tolist())),
+            )
+        conn.commit()
+        conn.close()
+    return len(rows)
+
+
+def start_canon_watcher() -> None:
+    """Background thread: rebuild the index whenever the canon changes on disk."""
+    def loop():
+        last = canon_signature()
+        while True:
+            time.sleep(WATCH_INTERVAL)
+            try:
+                sig = canon_signature()
+                if sig != last:
+                    n = rebuild_index()
+                    last = sig
+                    print(f"memory-mcp: canon changed, reindexed {n} facts", flush=True)
+            except Exception as e:  # never let the watcher kill the daemon
+                print(f"memory-mcp: watcher error: {e}", flush=True)
+
+    threading.Thread(target=loop, name="canon-watcher", daemon=True).start()
 
 
 mcp = FastMCP("memory", host="127.0.0.1", port=PORT)
@@ -150,7 +254,12 @@ def memory_list(limit: int = 50) -> list:
 
 
 if __name__ == "__main__":
-    init_db()
     embedder()  # warm the model once at startup
-    print(f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT}", flush=True)
+    n = rebuild_index()  # boot the index straight from the canon (source of truth)
+    start_canon_watcher()
+    print(
+        f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
+        f"facts={n} canon={CANON} watch={WATCH_INTERVAL}s",
+        flush=True,
+    )
     mcp.run(transport="streamable-http")
