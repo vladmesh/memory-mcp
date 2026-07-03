@@ -98,7 +98,21 @@ def add_memory(text: str, tags=None, source=None) -> int:
     return rid
 
 
-def search_memory(query: str, k: int = 5) -> list:
+def normalize_scope(scope: str | None) -> str | None:
+    """Accept "global", "project:<dir>" or a bare project dir name ("orca" → "project:orca")."""
+    if not scope:
+        return None
+    scope = scope.strip()
+    if scope in ("", "global") or scope.startswith("project:"):
+        return scope or None
+    return f"project:{scope}"
+
+
+def search_memory(query: str, k: int = 5, scope: str | None = None) -> list:
+    scope = normalize_scope(scope)
+    # sqlite-vec KNN can't push a join filter into MATCH, so with a scope we over-fetch
+    # and trim post-hoc — fine at canon size (hundreds of facts).
+    fetch = max(k * 5, 25) if scope else k
     qvec = sqlite_vec.serialize_float32(embed_query(query).tolist())
     with _reindex_lock:  # don't read while a rebuild is swapping tables
         conn = db()
@@ -106,9 +120,11 @@ def search_memory(query: str, k: int = 5) -> list:
             "SELECT v.rowid, v.distance, m.text, m.scope, m.tags, m.source, m.created_at "
             "FROM vec_memories v JOIN memories m ON m.id = v.rowid "
             "WHERE v.embedding MATCH ? AND k = ? ORDER BY v.distance",
-            (qvec, k),
+            (qvec, fetch),
         ).fetchall()
         conn.close()
+    if scope:
+        rows = [r for r in rows if r[3] == scope][:k]
     # unit vectors → L2 distance d relates to cosine: cos = 1 - d^2/2
     return [
         {
@@ -124,19 +140,23 @@ def search_memory(query: str, k: int = 5) -> list:
     ]
 
 
-def log_search(query: str, k: int, results: list) -> None:
+def log_search(query: str, k: int, results: list,
+               scope: str | None = None, caller: str | None = None) -> None:
     """Append one jsonl line per memory_search call. Best-effort telemetry:
-    any failure here is swallowed — logging must never break the search."""
+    any failure here is swallowed — logging must never break the search.
+    caller is self-reported by the agent (role name) — attribution, not auth."""
     try:
-        line = json.dumps(
-            {
-                "ts": datetime.datetime.utcnow().isoformat(),
-                "query": query,
-                "k": k,
-                "hits": [{"id": r["id"], "score": r["score"]} for r in results],
-            },
-            ensure_ascii=False,
-        )
+        entry = {
+            "ts": datetime.datetime.utcnow().isoformat(),
+            "query": query,
+            "k": k,
+            "hits": [{"id": r["id"], "score": r["score"]} for r in results],
+        }
+        if scope:
+            entry["scope"] = scope
+        if caller:
+            entry["caller"] = caller
+        line = json.dumps(entry, ensure_ascii=False)
         with _search_log_lock:  # one write per line so concurrent calls don't interleave
             with open(SEARCH_LOG, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -244,10 +264,16 @@ mcp = FastMCP("memory", host="127.0.0.1", port=PORT)
 
 
 @mcp.tool()
-def memory_search(query: str, k: int = 5) -> list:
-    """Semantic search over shared memory. Returns up to k closest entries with scores."""
-    results = search_memory(query, k)
-    log_search(query, k, results)  # tool-level: capture real agent queries, not internal calls
+def memory_search(query: str, k: int = 5, scope: str = "", caller: str = "") -> list:
+    """Semantic search over shared memory. Returns up to k closest entries with scores.
+
+    scope: optional filter — "global", "project:<dir>" or bare project dir name
+    (e.g. "orca", "triggered-agents"). Search your own project's scope first,
+    then retry without scope. caller: your role (worker/reviewer/steward/secretary/
+    curator) — telemetry only, always pass it."""
+    results = search_memory(query, k, scope=scope or None)
+    # tool-level: capture real agent queries, not internal calls
+    log_search(query, k, results, scope=normalize_scope(scope), caller=caller or None)
     return results
 
 
