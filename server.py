@@ -269,11 +269,16 @@ def memory_search(query: str, k: int = 5, scope: str = "", caller: str = "") -> 
 
     scope: optional filter — "global", "project:<dir>" or bare project dir name
     (e.g. "orca", "triggered-agents"). Search your own project's scope first,
-    then retry without scope. caller: your role (worker/reviewer/steward/secretary/
-    curator) — telemetry only, always pass it."""
+    then retry without scope. k is clamped to 10. caller: your role (worker/reviewer/
+    steward/secretary/curator) — telemetry only, always pass it."""
+    # Кап выдачи (решение vladmesh 2026-07-11): скоры у ранжировщика лежат в узкой полке
+    # (~0.80-0.84 по телеметрии), длинный хвост неотличим от топа и засоряет контекст.
+    # В лог пишем исходный k — телеметрия должна видеть, что просили на самом деле.
+    requested_k = k
+    k = max(1, min(k, 10))
     results = search_memory(query, k, scope=scope or None)
     # tool-level: capture real agent queries, not internal calls
-    log_search(query, k, results, scope=normalize_scope(scope), caller=caller or None)
+    log_search(query, requested_k, results, scope=normalize_scope(scope), caller=caller or None)
     return results
 
 
