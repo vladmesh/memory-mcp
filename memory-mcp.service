@@ -7,6 +7,9 @@ Type=simple
 User=dev
 Group=dev
 WorkingDirectory=/home/dev/memory-mcp
+Environment=MEMORY_CANON_ROOT=/home/dev/secretary-data/memory/facts
+Environment=MEMORY_CANON_EXPORT=/home/dev/secretary-data/memory/export.ndjson
+Environment=MEMORY_DB=/home/dev/secretary-data/memory/index.sqlite
 ExecStart=/home/dev/memory-mcp/run.sh
 Restart=always
 RestartSec=3

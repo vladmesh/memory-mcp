@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launch the memory-MCP HTTP daemon. Model loads once at startup and stays warm.
+# Launch the memory-MCP HTTP daemon. HTTP binds first; the model warms in-process.
 set -euo pipefail
 cd "$(dirname "$0")"
 . .venv/bin/activate
