@@ -1,4 +1,4 @@
-"""Memory MCP server — shared semantic memory for any MCP-speaking agent.
+"""Memory MCP server, shared semantic memory for any MCP-speaking agent.
 
 SQLite + sqlite-vec for storage/ANN, fastembed (bge-m3, multilingual) for embeddings,
 exposed over streamable-HTTP so Claude / Codex / Hermes all share ONE warm instance.
@@ -8,8 +8,11 @@ import json
 import os
 import sqlite3
 import datetime
+import subprocess
 import threading
 import time
+import tempfile
+from typing import Any
 from pathlib import Path
 
 import numpy as np
@@ -19,23 +22,30 @@ from fastembed import TextEmbedding
 from mcp.server.fastmcp import FastMCP
 
 HERE = Path(__file__).parent
-DB_PATH = os.environ.get("MEMORY_DB", str(HERE / "memory.db"))
+DEFAULT_MEMORY_DIR = Path.home() / "secretary-data" / "memory"
+DEFAULT_CANON = DEFAULT_MEMORY_DIR / "facts"
+
+if "MEMORY_CANON_ROOT" in os.environ:
+    CANON = Path(os.environ["MEMORY_CANON_ROOT"])
+elif "PANELMEM_KB" in os.environ:
+    CANON = Path(os.environ["PANELMEM_KB"]) / "memory"
+else:
+    CANON = DEFAULT_CANON
+
+DB_PATH = os.environ.get("MEMORY_DB", str(DEFAULT_MEMORY_DIR / "index.sqlite"))
 MODEL = os.environ.get("MEMORY_MODEL", "intfloat/multilingual-e5-large")
 PORT = int(os.environ.get("MEMORY_PORT", "8077"))
 DIM = int(os.environ.get("MEMORY_DIM", "1024"))
 SEARCH_LOG = os.environ.get("MEMORY_SEARCH_LOG", str(Path(DB_PATH).parent / "search-log.jsonl"))
-
-# Markdown canon (panelmem-kb) is source of truth; this index is derived. The daemon
-# owns the sqlite file, so the daemon rebuilds the index in-process — no stop/start,
-# no second writer. A watcher thread repolls the canon and rebuilds on change.
-KB = Path(os.environ.get("PANELMEM_KB", str(Path.home() / "panelmem-kb")))
-CANON = KB / "memory"
+CANON_EXPORT = Path(os.environ["MEMORY_CANON_EXPORT"]) if "MEMORY_CANON_EXPORT" in os.environ else CANON.parent / "export.ndjson"
 WATCH_INTERVAL = float(os.environ.get("MEMORY_WATCH_INTERVAL", "10"))
 
 _embedder = None
 _lock = threading.Lock()
 _reindex_lock = threading.Lock()
 _search_log_lock = threading.Lock()  # own lock: don't couple log I/O to embedder/reindex locks
+_ready_event = threading.Event()
+_ready_error = None
 
 
 def embedder() -> TextEmbedding:
@@ -60,16 +70,24 @@ def embed_query(text: str) -> np.ndarray:
     return _unit(list(embedder().query_embed(text))[0])
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+def db(path: str | Path | None = None) -> sqlite3.Connection:
+    path = Path(path or DB_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
     conn.enable_load_extension(True)
     sqlite_vec.load(conn)
     conn.enable_load_extension(False)
     return conn
 
 
-def init_db() -> None:
-    conn = db()
+def init_db(path: str | Path = DB_PATH) -> None:
+    conn = db(path)
+    create_schema(conn)
+    conn.commit()
+    conn.close()
+
+
+def create_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS memories("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
@@ -78,8 +96,42 @@ def init_db() -> None:
     conn.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{DIM}])"
     )
-    conn.commit()
-    conn.close()
+
+
+class NotReadyError(RuntimeError):
+    def __init__(self, reason: str, detail: str):
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+def not_ready_response(reason: str, detail: str) -> dict:
+    return {
+        "status": "not_ready",
+        "error": reason,
+        "retryable": True,
+        "detail": detail,
+    }
+
+
+def index_exists() -> bool:
+    return Path(DB_PATH).is_file()
+
+
+def search_ready() -> bool:
+    return _ready_event.is_set() and index_exists()
+
+
+def mark_search_ready(error: Exception | None = None) -> None:
+    global _ready_error
+    _ready_error = error
+    _ready_event.set()
+
+
+def mark_search_not_ready(error: Exception | None = None) -> None:
+    global _ready_error
+    _ready_error = error
+    _ready_event.clear()
 
 
 def add_memory(text: str, tags=None, source=None) -> int:
@@ -109,9 +161,11 @@ def normalize_scope(scope: str | None) -> str | None:
 
 
 def search_memory(query: str, k: int = 5, scope: str | None = None) -> list:
+    if not index_exists():
+        raise NotReadyError("index_missing", f"index does not exist: {DB_PATH}")
     scope = normalize_scope(scope)
     # sqlite-vec KNN can't push a join filter into MATCH, so with a scope we over-fetch
-    # and trim post-hoc — fine at canon size (hundreds of facts).
+    # and trim post-hoc. Fine at canon size (hundreds of facts).
     fetch = max(k * 5, 25) if scope else k
     qvec = sqlite_vec.serialize_float32(embed_query(query).tolist())
     with _reindex_lock:  # don't read while a rebuild is swapping tables
@@ -143,8 +197,8 @@ def search_memory(query: str, k: int = 5, scope: str | None = None) -> list:
 def log_search(query: str, k: int, results: list,
                scope: str | None = None, caller: str | None = None) -> None:
     """Append one jsonl line per memory_search call. Best-effort telemetry:
-    any failure here is swallowed — logging must never break the search.
-    caller is self-reported by the agent (role name) — attribution, not auth."""
+    any failure here is swallowed. Logging must never break the search.
+    caller is self-reported by the agent (role name), attribution, not auth."""
     try:
         entry = {
             "ts": datetime.datetime.utcnow().isoformat(),
@@ -166,65 +220,189 @@ def log_search(query: str, k: int, results: list,
 
 
 # ── Canon → index (daemon-owned reindex) ──────────────────────────────────────
-# Kept in sync with reindex.py's parsing; reindex.py is the manual fallback and
-# reuses these functions.
+# The default source is secretary-data/memory/facts. Prefer the atomically
+# published export.ndjson snapshot; rollback to the old panelmem-kb repo is one
+# setting, MEMORY_CANON_ROOT=/home/dev/panelmem-kb/memory, and then we read HEAD.
 
 
-def scope_for(path: Path) -> str:
-    top = path.relative_to(CANON).parts[0]
+def scope_for_relative(path: Path) -> str:
+    top = path.parts[0]
     return "global" if top == "global" else f"project:{top}"
 
 
-def parse_fact(path: Path) -> dict:
-    raw = path.read_text(encoding="utf-8")
+def parse_frontmatter(raw: str) -> tuple[dict, str]:
     meta, body = {}, raw
     if raw.startswith("---"):
         _, front, body = raw.split("---", 2)
         meta = yaml.safe_load(front) or {}
+    return meta, body
+
+
+def parse_fact_text(raw: str, path: str | Path, fact_id: str | None = None) -> dict:
+    rel = Path(path)
+    meta, body = parse_frontmatter(raw)
     tags = meta.get("tags")
+    if isinstance(tags, str):
+        tag_text = tags
+    else:
+        tag_text = ",".join(tags) if tags else None
     return {
-        "scope": scope_for(path),
+        "id": fact_id or str(rel.with_suffix("")),
+        "path": str(rel),
+        "slug": rel.stem,
+        "scope": scope_for_relative(rel),
         "text": body.strip(),
-        "tags": ",".join(tags) if tags else None,
+        "tags": tag_text,
         "source": meta.get("source"),
         "created_at": str(meta["created"]) if meta.get("created") else None,
+        "meta": meta,
     }
 
 
-def load_canon() -> list:
+def deleted_fact(meta: dict) -> bool:
+    status = str(meta.get("status") or meta.get("state") or "").strip().lower()
+    return (
+        meta.get("deleted") is True
+        or meta.get("tombstone") is True
+        or meta.get("active") is False
+        or status in {"deleted", "superseded", "removed", "tombstone"}
+    )
+
+
+def supersede_refs(meta: dict) -> list[str]:
+    value = meta.get("supersedes")
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        return [str(part).strip() for part in value if str(part).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def fact_ref_matches(fact: dict, ref: str) -> bool:
+    ref_path = Path(ref)
+    if "/" in ref:
+        normalized = str(ref_path.with_suffix(""))
+        return normalized in {
+            fact["id"],
+            str(Path(fact["path"]).with_suffix("")),
+            fact["path"],
+        }
+    return ref in {fact["slug"], fact["id"], str(Path(fact["path"]).with_suffix(""))}
+
+
+def filter_current_facts(facts: list[dict]) -> list[dict]:
+    active = [fact for fact in facts if not deleted_fact(fact["meta"])]
+    superseded: list[tuple[str, str]] = []
+    for fact in active:
+        superseded.extend((fact["id"], ref) for ref in supersede_refs(fact["meta"]))
+    current = []
+    for fact in active:
+        removed = any(owner != fact["id"] and fact_ref_matches(fact, ref) for owner, ref in superseded)
+        if not removed:
+            current.append(fact)
+    return current
+
+
+def load_export_snapshot(path: Path) -> list[dict]:
+    facts = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            obj = json.loads(line)
+            raw = obj.get("text", "")
+            rel = obj.get("path") or f"{obj['id']}.md"
+            facts.append(parse_fact_text(raw, rel, fact_id=obj.get("id")))
+    return facts
+
+
+def git_repo_root(path: Path) -> Path | None:
+    proc = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    if proc.returncode != 0:
+        return None
+    return Path(proc.stdout.strip())
+
+
+def load_git_head_snapshot(path: Path) -> list[dict]:
+    root = git_repo_root(path)
+    if root is None:
+        raise RuntimeError(f"canon snapshot unavailable: {path} is not a git worktree")
+    prefix = path.resolve().relative_to(root.resolve())
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "-r", "-z", "--name-only", "HEAD", "--", str(prefix)],
+        check=True,
+        stdout=subprocess.PIPE,
+    )
+    facts = []
+    for raw_name in proc.stdout.split(b"\0"):
+        if not raw_name:
+            continue
+        repo_rel = raw_name.decode("utf-8")
+        if not repo_rel.endswith(".md"):
+            continue
+        rel = Path(repo_rel).relative_to(prefix)
+        show = subprocess.run(
+            ["git", "-C", str(root), "show", f"HEAD:{repo_rel}"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        facts.append(parse_fact_text(show.stdout, rel, fact_id=str(rel.with_suffix(""))))
+    return facts
+
+
+def load_canon_entries() -> list[dict]:
+    if CANON_EXPORT.is_file():
+        return load_export_snapshot(CANON_EXPORT)
     if not CANON.is_dir():
         return []
-    return [parse_fact(md) for md in sorted(CANON.rglob("*.md"))]
+    return load_git_head_snapshot(CANON)
+
+
+def load_canon() -> list:
+    return filter_current_facts(load_canon_entries())
 
 
 def canon_signature() -> tuple:
     """Cheap change token: (file count, max mtime, total size). Catches add/edit/delete."""
+    if CANON_EXPORT.is_file():
+        st = CANON_EXPORT.stat()
+        return ("export", st.st_mtime, st.st_size)
+    root = git_repo_root(CANON) if CANON.is_dir() else None
+    if root is not None:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+        )
+        return ("git", proc.stdout.strip())
     if not CANON.is_dir():
         return (0, 0.0, 0)
-    count = mtime = size = 0
-    for md in CANON.rglob("*.md"):
-        st = md.stat()
-        count += 1
-        mtime = max(mtime, st.st_mtime)
-        size += st.st_size
-    return (count, mtime, size)
+    raise RuntimeError(f"canon snapshot unavailable: no {CANON_EXPORT} and {CANON} is not in git")
 
 
 def rebuild_index() -> int:
-    """Rebuild memories + vec_memories from the canon. Embeds outside the lock; only the
-    drop/create/insert runs under _reindex_lock so searches see a brief, consistent swap."""
+    """Rebuild memories + vec_memories from the canon and publish atomically."""
     facts = load_canon()
     rows = [(f, embed_doc(f["text"])) for f in facts]  # slow part, no lock held
-    with _reindex_lock:
-        conn = db()
-        conn.execute("DROP TABLE IF EXISTS memories")
-        conn.execute("DROP TABLE IF EXISTS vec_memories")
-        conn.execute(
-            "CREATE TABLE memories("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
-            "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
-        )
-        conn.execute(f"CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[{DIM}])")
+    target = Path(DB_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    os.close(fd)
+    tmp = Path(tmp_name)
+    tmp.unlink(missing_ok=True)
+    try:
+        conn = db(tmp)
+        create_schema(conn)
         for f, vec in rows:
             cur = conn.execute(
                 "INSERT INTO memories(text, scope, tags, source, created_at) VALUES (?,?,?,?,?)",
@@ -236,7 +414,60 @@ def rebuild_index() -> int:
             )
         conn.commit()
         conn.close()
+        with _reindex_lock:
+            os.replace(tmp, target)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     return len(rows)
+
+
+def indexed_fact_count() -> int:
+    if not index_exists():
+        return 0
+    with _reindex_lock:
+        conn = db()
+        count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+        conn.close()
+    return count
+
+
+def parity_gate() -> dict:
+    expected = len(load_canon())
+    indexed = indexed_fact_count()
+    return {"ok": expected == indexed, "expected": expected, "indexed": indexed}
+
+
+def bootstrap_index() -> int | None:
+    """Warm the embedder and rebuild. Keep a previous index usable if rebuild fails."""
+    mark_search_not_ready()
+    embedder()
+    try:
+        n = rebuild_index()
+    except Exception as e:
+        if index_exists():
+            mark_search_ready(e)
+            print(f"memory-mcp: rebuild failed, keeping previous index: {e}", flush=True)
+            return None
+        mark_search_not_ready(e)
+        print(f"memory-mcp: rebuild failed, no index available: {e}", flush=True)
+        return None
+    mark_search_ready()
+    return n
+
+
+def start_background_bootstrap() -> None:
+    def loop():
+        n = bootstrap_index()
+        if n is not None:
+            print(
+                f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
+                f"facts={n} canon={CANON} export={CANON_EXPORT} watch={WATCH_INTERVAL}s",
+                flush=True,
+            )
+        start_canon_watcher()
+
+    threading.Thread(target=loop, name="bootstrap-index", daemon=True).start()
 
 
 def start_canon_watcher() -> None:
@@ -249,6 +480,7 @@ def start_canon_watcher() -> None:
                 sig = canon_signature()
                 if sig != last:
                     n = rebuild_index()
+                    mark_search_ready()
                     last = sig
                     print(f"memory-mcp: canon changed, reindexed {n} facts", flush=True)
             except Exception as e:  # never let the watcher kill the daemon
@@ -264,19 +496,28 @@ mcp = FastMCP("memory", host="127.0.0.1", port=PORT)
 
 
 @mcp.tool()
-def memory_search(query: str, k: int = 5, scope: str = "", caller: str = "") -> list:
+def memory_search(query: str, k: int = 5, scope: str = "", caller: str = "") -> Any:
     """Semantic search over shared memory. Returns up to k closest entries with scores.
 
-    scope: optional filter — "global", "project:<dir>" or bare project dir name
+    scope: optional filter, "global", "project:<dir>" or bare project dir name
     (e.g. "orca", "triggered-agents"). Search your own project's scope first,
     then retry without scope. k is clamped to 10. caller: your role (worker/reviewer/
-    steward/secretary/curator) — telemetry only, always pass it."""
+    steward/secretary/curator), telemetry only, always pass it."""
     # Кап выдачи (решение vladmesh 2026-07-11): скоры у ранжировщика лежат в узкой полке
     # (~0.80-0.84 по телеметрии), длинный хвост неотличим от топа и засоряет контекст.
-    # В лог пишем исходный k — телеметрия должна видеть, что просили на самом деле.
+    # В лог пишем исходный k: телеметрия должна видеть, что просили на самом деле.
     requested_k = k
     k = max(1, min(k, 10))
-    results = search_memory(query, k, scope=scope or None)
+    if not search_ready():
+        reason = "embedder_loading" if _ready_error is None else "index_unavailable"
+        detail = "embedding model/index are still loading"
+        if _ready_error is not None:
+            detail = str(_ready_error)
+        return not_ready_response(reason, detail)
+    try:
+        results = search_memory(query, k, scope=scope or None)
+    except NotReadyError as e:
+        return not_ready_response(e.reason, e.detail)
     # tool-level: capture real agent queries, not internal calls
     log_search(query, requested_k, results, scope=normalize_scope(scope), caller=caller or None)
     return results
@@ -285,6 +526,8 @@ def memory_search(query: str, k: int = 5, scope: str = "", caller: str = "") -> 
 @mcp.tool()
 def memory_get(id: int) -> dict:
     """Fetch one memory entry by id."""
+    if not index_exists():
+        return not_ready_response("index_missing", f"index does not exist: {DB_PATH}")
     conn = db()
     r = conn.execute(
         "SELECT id, text, scope, tags, source, created_at FROM memories WHERE id = ?", (id,)
@@ -298,6 +541,8 @@ def memory_get(id: int) -> dict:
 @mcp.tool()
 def memory_list(limit: int = 50) -> list:
     """List recent memory entries (newest first)."""
+    if not index_exists():
+        return [not_ready_response("index_missing", f"index does not exist: {DB_PATH}")]
     conn = db()
     rows = conn.execute(
         "SELECT id, text, scope, tags, source, created_at FROM memories ORDER BY id DESC LIMIT ?",
@@ -311,12 +556,9 @@ def memory_list(limit: int = 50) -> list:
 
 
 if __name__ == "__main__":
-    embedder()  # warm the model once at startup
-    n = rebuild_index()  # boot the index straight from the canon (source of truth)
-    start_canon_watcher()
     print(
-        f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
-        f"facts={n} canon={CANON} watch={WATCH_INTERVAL}s",
+        f"memory-mcp listening: port={PORT} db={DB_PATH} canon={CANON}; index warming in background",
         flush=True,
     )
+    start_background_bootstrap()
     mcp.run(transport="streamable-http")
