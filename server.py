@@ -109,6 +109,10 @@ class NotReadyError(RuntimeError):
         self.detail = detail
 
 
+class IndexReadError(RuntimeError):
+    pass
+
+
 def not_ready_response(reason: str, detail: str) -> dict:
     return {
         "status": "not_ready",
@@ -406,14 +410,19 @@ def build_document_embedder(model: str):
     return embed
 
 
-def indexed_fact_count(path: str | Path = DB_PATH) -> int:
-    path = Path(path)
+def indexed_fact_count(path: str | Path | None = None) -> int:
+    path = Path(path or DB_PATH)
     if not path.is_file():
         return 0
-    conn = db(path)
-    count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
-    conn.close()
-    return count
+    conn = None
+    try:
+        conn = db(path)
+        return conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    except sqlite3.DatabaseError as error:
+        raise IndexReadError(f"index unreadable: {path}: {error}") from error
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def write_index(facts: list[dict], target: Path, model: str, dim: int, document_embed) -> int:
@@ -457,18 +466,27 @@ def index_metadata(path: str | Path) -> dict[str, str]:
     path = Path(path)
     if not path.is_file():
         return {}
-    conn = db(path)
+    conn = None
     try:
+        conn = db(path)
         rows = conn.execute("SELECT key, value FROM index_metadata").fetchall()
-    except sqlite3.OperationalError:
-        rows = []
+    except sqlite3.OperationalError as error:
+        if "no such table: index_metadata" in str(error):
+            return {}
+        raise IndexReadError(f"index unreadable: {path}: {error}") from error
+    except sqlite3.DatabaseError as error:
+        raise IndexReadError(f"index unreadable: {path}: {error}") from error
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
     return {key: value for key, value in rows}
 
 
 def index_compatibility(path: str | Path, model: str, dim: int) -> tuple[str, str | None]:
-    metadata = index_metadata(path)
+    try:
+        metadata = index_metadata(path)
+    except IndexReadError as error:
+        return "unusable", str(error)
     if not metadata:
         return "legacy", None
     if metadata.get("model") != model or metadata.get("dimension") != str(dim):
@@ -544,7 +562,7 @@ def bootstrap_index() -> int | None:
     except Exception as e:
         has_index = index_exists()
         status, detail = index_compatibility(DB_PATH, MODEL, DIM) if has_index else ("missing", None)
-        if has_index and status != "mismatch":
+        if has_index and status in {"compatible", "legacy"}:
             mark_search_ready(e)
             print(f"memory-mcp: rebuild failed, keeping previous index: {e}", flush=True)
             return None
@@ -564,14 +582,16 @@ def bootstrap_index() -> int | None:
 
 def start_background_bootstrap() -> None:
     def loop():
-        n = bootstrap_index()
-        if n is not None:
-            print(
-                f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
-                f"facts={n} canon={CANON} export={CANON_EXPORT} watch={WATCH_INTERVAL}s",
-                flush=True,
-            )
-        start_canon_watcher()
+        try:
+            n = bootstrap_index()
+            if n is not None:
+                print(
+                    f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
+                    f"facts={n} canon={CANON} export={CANON_EXPORT} watch={WATCH_INTERVAL}s",
+                    flush=True,
+                )
+        finally:
+            start_canon_watcher()
 
     threading.Thread(target=loop, name="bootstrap-index", daemon=True).start()
 

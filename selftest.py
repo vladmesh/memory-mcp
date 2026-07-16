@@ -214,6 +214,31 @@ def run_legacy_index_stays_ready_after_failed_rebuild() -> None:
         server.rebuild_index = original_rebuild
 
 
+def run_corrupt_index_stays_not_ready_and_starts_watcher() -> None:
+    corrupt_db = TMP / "corrupt-index.sqlite"
+    corrupt_db.write_bytes(b"not a sqlite database")
+    watcher_started = server.threading.Event()
+    original_db = server.DB_PATH
+    original_rebuild = server.rebuild_index
+    original_watcher = server.start_canon_watcher
+    server.DB_PATH = str(corrupt_db)
+    server.rebuild_index = lambda: (_ for _ in ()).throw(RuntimeError("forced rebuild failure"))
+    server.start_canon_watcher = watcher_started.set
+    try:
+        server.start_background_bootstrap()
+        assert_true(watcher_started.wait(1), "watcher did not start after corrupt-index failure")
+        assert_true(not server.search_ready(), "corrupt index became ready")
+        response = server.memory_search("legacy alpha", caller="selftest")
+        assert_true(
+            response["status"] == "not_ready" and "index unreadable" in response["detail"],
+            f"corrupt index did not return a truthful not-ready response: {response}",
+        )
+    finally:
+        server.DB_PATH = original_db
+        server.rebuild_index = original_rebuild
+        server.start_canon_watcher = original_watcher
+
+
 def run_readiness_checks() -> None:
     server.mark_search_not_ready()
     response = server.memory_search("openrouter api key", caller="worker")
@@ -264,6 +289,7 @@ try:
     run_empty_export_preserves_index()
     run_metadata_mismatch_stays_not_ready()
     run_legacy_index_stays_ready_after_failed_rebuild()
+    run_corrupt_index_stays_not_ready_and_starts_watcher()
     run_readiness_checks()
     run_git_fallback_checks()
 finally:
