@@ -119,14 +119,17 @@ def run_export_rebuild_checks() -> None:
         ]
     )
 
-    n = reindex.reindex()
-    assert_true(n == 3, f"expected 3 current facts, got {n}")
+    result = reindex.rebuild(CANON, EXPORT, DB, "selftest", 4, document_embed=fake_vec)
+    assert_true(result["parity"] == {"expected": 3, "indexed": 3, "ok": True}, f"bad rebuild result: {result}")
     parity = server.parity_gate()
     assert_true(parity == {"ok": True, "expected": 3, "indexed": 3}, f"bad parity: {parity}")
 
-    hit = server.search_memory("openrouter api key", k=1)[0]
+    server.mark_search_ready()
+    hit = server.memory_search("openrouter api key", k=1, caller="selftest")[0]
     assert_true("open_router_key" in hit["text"] and hit["scope"] == "global", "known fact search failed")
     rows = server.memory_list(limit=10)
+    fetched = server.memory_get(hit["id"])
+    assert_true(fetched["id"] == hit["id"] and fetched["text"] == hit["text"], "memory_get did not return search hit")
     text = "\n".join(row["text"] for row in rows)
     assert_true("old_port_marker" not in text, "superseded fact leaked into index")
     assert_true("deleted_marker" not in text, "deleted fact leaked into index")
@@ -147,6 +150,93 @@ def run_failed_rebuild_preserves_index() -> None:
         raise AssertionError("rebuild unexpectedly succeeded")
     after = server.search_memory("openrouter api key", k=1)[0]["text"]
     assert_true(before == after, "failed rebuild replaced the previous index")
+
+
+def run_empty_export_preserves_index() -> None:
+    before = server.search_memory("openrouter api key", k=1)[0]["text"]
+    write_export([])
+    try:
+        reindex.rebuild(CANON, EXPORT, DB, "selftest", 4, document_embed=fake_vec)
+    except RuntimeError as error:
+        assert_true("no current facts" in str(error), f"unexpected empty export error: {error}")
+    else:
+        raise AssertionError("empty export rebuild unexpectedly succeeded")
+    after = server.search_memory("openrouter api key", k=1)[0]["text"]
+    assert_true(before == after, "empty export replaced the previous index")
+
+
+def run_metadata_mismatch_stays_not_ready() -> None:
+    metadata = server.index_metadata(DB)
+    assert_true(metadata == {"model": "selftest", "dimension": "4"}, f"bad index metadata: {metadata}")
+    original_model = server.MODEL
+    original_rebuild = server.rebuild_index
+    server.MODEL = "configured-model"
+    server.rebuild_index = lambda: (_ for _ in ()).throw(RuntimeError("forced rebuild failure"))
+    try:
+        assert_true(server.bootstrap_index() is None and not server.search_ready(), "mismatched index became ready")
+        response = server.memory_search("openrouter api key", caller="selftest")
+        assert_true(
+            response["status"] == "not_ready" and "metadata mismatch" in response["detail"],
+            f"mismatch did not return an explicit not-ready response: {response}",
+        )
+    finally:
+        server.MODEL = original_model
+        server.rebuild_index = original_rebuild
+
+
+def run_legacy_index_stays_ready_after_failed_rebuild() -> None:
+    legacy_db = TMP / "legacy-index.sqlite"
+    conn = server.db(legacy_db)
+    conn.execute(
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
+        "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
+    )
+    conn.execute("CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[4])")
+    cur = conn.execute("INSERT INTO memories(text) VALUES (?)", ("legacy alpha fact",))
+    conn.execute(
+        "INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)",
+        (cur.lastrowid, server.sqlite_vec.serialize_float32(fake_vec("legacy alpha fact").tolist())),
+    )
+    conn.commit()
+    conn.close()
+
+    original_db = server.DB_PATH
+    original_rebuild = server.rebuild_index
+    server.DB_PATH = str(legacy_db)
+    server.rebuild_index = lambda: (_ for _ in ()).throw(RuntimeError("forced rebuild failure"))
+    try:
+        assert_true(server.index_metadata(legacy_db) == {}, "legacy test index unexpectedly has metadata")
+        assert_true(server.bootstrap_index() is None and server.search_ready(), "legacy index was not retained")
+        hit = server.memory_search("legacy alpha", k=1, caller="selftest")[0]
+        assert_true(hit["text"] == "legacy alpha fact", "legacy index no longer serves search")
+    finally:
+        server.DB_PATH = original_db
+        server.rebuild_index = original_rebuild
+
+
+def run_corrupt_index_stays_not_ready_and_starts_watcher() -> None:
+    corrupt_db = TMP / "corrupt-index.sqlite"
+    corrupt_db.write_bytes(b"not a sqlite database")
+    watcher_started = server.threading.Event()
+    original_db = server.DB_PATH
+    original_rebuild = server.rebuild_index
+    original_watcher = server.start_canon_watcher
+    server.DB_PATH = str(corrupt_db)
+    server.rebuild_index = lambda: (_ for _ in ()).throw(RuntimeError("forced rebuild failure"))
+    server.start_canon_watcher = watcher_started.set
+    try:
+        server.start_background_bootstrap()
+        assert_true(watcher_started.wait(1), "watcher did not start after corrupt-index failure")
+        assert_true(not server.search_ready(), "corrupt index became ready")
+        response = server.memory_search("legacy alpha", caller="selftest")
+        assert_true(
+            response["status"] == "not_ready" and "index unreadable" in response["detail"],
+            f"corrupt index did not return a truthful not-ready response: {response}",
+        )
+    finally:
+        server.DB_PATH = original_db
+        server.rebuild_index = original_rebuild
+        server.start_canon_watcher = original_watcher
 
 
 def run_readiness_checks() -> None:
@@ -186,8 +276,8 @@ def run_git_fallback_checks() -> None:
 
     path.write_text(fact("fallback", "dirty fallback fact should be ignored"), encoding="utf-8")
     configure(legacy_canon, legacy / "export.ndjson", legacy_db)
-    n = reindex.reindex()
-    assert_true(n == 1, f"fallback expected 1 fact, got {n}")
+    result = reindex.rebuild(legacy_canon, legacy / "export.ndjson", legacy_db, "selftest", 4, document_embed=fake_vec)
+    assert_true(result["parity"]["indexed"] == 1, f"fallback expected 1 fact, got {result}")
     hit = server.search_memory("fallback rollback", k=1)[0]["text"]
     assert_true("committed rollback" in hit and "dirty" not in hit, "fallback did not read committed HEAD")
 
@@ -196,6 +286,10 @@ try:
     configure(CANON, EXPORT, DB)
     run_export_rebuild_checks()
     run_failed_rebuild_preserves_index()
+    run_empty_export_preserves_index()
+    run_metadata_mismatch_stays_not_ready()
+    run_legacy_index_stays_ready_after_failed_rebuild()
+    run_corrupt_index_stays_not_ready_and_starts_watcher()
     run_readiness_checks()
     run_git_fallback_checks()
 finally:

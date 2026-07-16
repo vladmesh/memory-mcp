@@ -87,14 +87,18 @@ def init_db(path: str | Path = DB_PATH) -> None:
     conn.close()
 
 
-def create_schema(conn: sqlite3.Connection) -> None:
+def create_schema(conn: sqlite3.Connection, dim: int | None = None) -> None:
+    dim = DIM if dim is None else dim
     conn.execute(
         "CREATE TABLE IF NOT EXISTS memories("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
         "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
     )
     conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{DIM}])"
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{dim}])"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS index_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
 
 
@@ -103,6 +107,10 @@ class NotReadyError(RuntimeError):
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
+
+
+class IndexReadError(RuntimeError):
+    pass
 
 
 def not_ready_response(reason: str, detail: str) -> dict:
@@ -359,16 +367,18 @@ def load_git_head_snapshot(path: Path) -> list[dict]:
     return facts
 
 
-def load_canon_entries() -> list[dict]:
-    if CANON_EXPORT.is_file():
-        return load_export_snapshot(CANON_EXPORT)
-    if not CANON.is_dir():
+def load_canon_entries(canon: Path | None = None, export: Path | None = None) -> list[dict]:
+    canon = canon or CANON
+    export = export or CANON_EXPORT
+    if export.is_file():
+        return load_export_snapshot(export)
+    if not canon.is_dir():
         return []
-    return load_git_head_snapshot(CANON)
+    return load_git_head_snapshot(canon)
 
 
-def load_canon() -> list:
-    return filter_current_facts(load_canon_entries())
+def load_canon(canon: Path | None = None, export: Path | None = None) -> list:
+    return filter_current_facts(load_canon_entries(canon, export))
 
 
 def canon_signature() -> tuple:
@@ -390,11 +400,34 @@ def canon_signature() -> tuple:
     raise RuntimeError(f"canon snapshot unavailable: no {CANON_EXPORT} and {CANON} is not in git")
 
 
-def rebuild_index() -> int:
-    """Rebuild memories + vec_memories from the canon and publish atomically."""
-    facts = load_canon()
-    rows = [(f, embed_doc(f["text"])) for f in facts]  # slow part, no lock held
-    target = Path(DB_PATH)
+def build_document_embedder(model: str):
+    """Return a normalized document embedder for an explicit model."""
+    embedding_model = TextEmbedding(model_name=model)
+
+    def embed(text: str) -> np.ndarray:
+        return _unit(list(embedding_model.embed([text]))[0])
+
+    return embed
+
+
+def indexed_fact_count(path: str | Path | None = None) -> int:
+    path = Path(path or DB_PATH)
+    if not path.is_file():
+        return 0
+    conn = None
+    try:
+        conn = db(path)
+        return conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    except sqlite3.DatabaseError as error:
+        raise IndexReadError(f"index unreadable: {path}: {error}") from error
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def write_index(facts: list[dict], target: Path, model: str, dim: int, document_embed) -> int:
+    """Write a complete index to a temporary file, then atomically publish it."""
+    rows = [(fact, document_embed(fact["text"])) for fact in facts]
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     os.close(fd)
@@ -402,7 +435,11 @@ def rebuild_index() -> int:
     tmp.unlink(missing_ok=True)
     try:
         conn = db(tmp)
-        create_schema(conn)
+        create_schema(conn, dim)
+        conn.executemany(
+            "INSERT INTO index_metadata(key, value) VALUES (?, ?)",
+            [("model", model), ("dimension", str(dim))],
+        )
         for f, vec in rows:
             cur = conn.execute(
                 "INSERT INTO memories(text, scope, tags, source, created_at) VALUES (?,?,?,?,?)",
@@ -414,27 +451,105 @@ def rebuild_index() -> int:
             )
         conn.commit()
         conn.close()
+        indexed = indexed_fact_count(tmp)
+        if indexed != len(facts):
+            raise RuntimeError(f"index parity failed before publish: expected {len(facts)}, got {indexed}")
         with _reindex_lock:
             os.replace(tmp, target)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
-    return len(rows)
+    return indexed_fact_count(target)
 
 
-def indexed_fact_count() -> int:
-    if not index_exists():
-        return 0
-    with _reindex_lock:
-        conn = db()
-        count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
-        conn.close()
-    return count
+def index_metadata(path: str | Path) -> dict[str, str]:
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    conn = None
+    try:
+        conn = db(path)
+        rows = conn.execute("SELECT key, value FROM index_metadata").fetchall()
+    except sqlite3.OperationalError as error:
+        if "no such table: index_metadata" in str(error):
+            return {}
+        raise IndexReadError(f"index unreadable: {path}: {error}") from error
+    except sqlite3.DatabaseError as error:
+        raise IndexReadError(f"index unreadable: {path}: {error}") from error
+    finally:
+        if conn is not None:
+            conn.close()
+    return {key: value for key, value in rows}
+
+
+def index_compatibility(path: str | Path, model: str, dim: int) -> tuple[str, str | None]:
+    try:
+        metadata = index_metadata(path)
+    except IndexReadError as error:
+        return "unusable", str(error)
+    if not metadata:
+        return "legacy", None
+    if metadata.get("model") != model or metadata.get("dimension") != str(dim):
+        return "mismatch", (
+            f"index metadata mismatch: expected model={model!r} dimension={dim}, "
+            f"got model={metadata.get('model')!r} dimension={metadata.get('dimension')!r}"
+        )
+    return "compatible", None
+
+
+def offline_rebuild(
+    canon: str | Path,
+    export: str | Path,
+    target_db: str | Path,
+    model: str,
+    dim: int,
+    document_embed=None,
+    allow_empty: bool = False,
+) -> dict:
+    """Build and atomically publish an index from an explicit canon snapshot.
+
+    ``document_embed`` is an injection point for tests. Production callers omit it,
+    which loads the requested fastembed model.
+    """
+    canon_path = Path(canon)
+    export_path = Path(export)
+    target = Path(target_db)
+    if int(dim) <= 0:
+        raise ValueError(f"dimension must be positive: {dim}")
+    if not export_path.is_file() and not canon_path.is_dir():
+        raise RuntimeError(
+            f"canon snapshot unavailable: no export at {export_path} and no canon at {canon_path}"
+        )
+    facts = load_canon(canon_path, export_path)
+    if not facts and not allow_empty:
+        raise RuntimeError("canon snapshot has no current facts; pass allow_empty=True to publish an empty index")
+    document_embed = document_embed or build_document_embedder(model)
+    indexed = write_index(facts, target, model, int(dim), document_embed)
+    parity = {"expected": len(facts), "indexed": indexed, "ok": indexed == len(facts)}
+    if not parity["ok"]:
+        raise RuntimeError(f"index parity failed after publish: expected {len(facts)}, got {indexed}")
+    return {
+        "ok": parity["ok"],
+        "canon": str(canon_path),
+        "export": str(export_path),
+        "target_db": str(target),
+        "model": model,
+        "dimension": int(dim),
+        "parity": parity,
+    }
+
+
+def rebuild_index() -> int:
+    """Daemon rebuild using its configured canon, model, and target database."""
+    result = offline_rebuild(
+        CANON, CANON_EXPORT, DB_PATH, MODEL, DIM, document_embed=embed_doc, allow_empty=True
+    )
+    return result["parity"]["indexed"]
 
 
 def parity_gate() -> dict:
     expected = len(load_canon())
-    indexed = indexed_fact_count()
+    indexed = indexed_fact_count(DB_PATH)
     return {"ok": expected == indexed, "expected": expected, "indexed": indexed}
 
 
@@ -445,12 +560,21 @@ def bootstrap_index() -> int | None:
     try:
         n = rebuild_index()
     except Exception as e:
-        if index_exists():
+        has_index = index_exists()
+        status, detail = index_compatibility(DB_PATH, MODEL, DIM) if has_index else ("missing", None)
+        if has_index and status in {"compatible", "legacy"}:
             mark_search_ready(e)
             print(f"memory-mcp: rebuild failed, keeping previous index: {e}", flush=True)
             return None
-        mark_search_not_ready(e)
-        print(f"memory-mcp: rebuild failed, no index available: {e}", flush=True)
+        error = RuntimeError(detail) if detail else e
+        mark_search_not_ready(error)
+        print(f"memory-mcp: rebuild failed, no compatible index available: {error}", flush=True)
+        return None
+    status, detail = index_compatibility(DB_PATH, MODEL, DIM)
+    if status != "compatible":
+        error = detail or "rebuilt index has no metadata"
+        mark_search_not_ready(RuntimeError(error))
+        print(f"memory-mcp: rebuilt index is incompatible: {error}", flush=True)
         return None
     mark_search_ready()
     return n
@@ -458,14 +582,16 @@ def bootstrap_index() -> int | None:
 
 def start_background_bootstrap() -> None:
     def loop():
-        n = bootstrap_index()
-        if n is not None:
-            print(
-                f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
-                f"facts={n} canon={CANON} export={CANON_EXPORT} watch={WATCH_INTERVAL}s",
-                flush=True,
-            )
-        start_canon_watcher()
+        try:
+            n = bootstrap_index()
+            if n is not None:
+                print(
+                    f"memory-mcp ready: model={MODEL} dim={DIM} db={DB_PATH} port={PORT} "
+                    f"facts={n} canon={CANON} export={CANON_EXPORT} watch={WATCH_INTERVAL}s",
+                    flush=True,
+                )
+        finally:
+            start_canon_watcher()
 
     threading.Thread(target=loop, name="bootstrap-index", daemon=True).start()
 

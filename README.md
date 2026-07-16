@@ -43,7 +43,40 @@ claude mcp add --scope user --transport http panelmem http://127.0.0.1:8077/mcp
 | `MEMORY_PORT` | `8077` | HTTP port |
 | `MEMORY_SEARCH_LOG` | `<db dir>/search-log.jsonl` | append-only jsonl log of every `memory_search` call |
 
-Changing the model means re-embedding: stop the daemon, set `MEMORY_MODEL`/`MEMORY_DIM`, run `python reindex.py`, start again.
+Changing the model means re-embedding: stop the daemon, set `MEMORY_MODEL`/`MEMORY_DIM`, rebuild, start again.
+
+## Restore / reconcile rebuild
+
+`reindex.py` is the public offline entry point for an appliance restore or a
+reconcile handoff. Pass the restored canon paths and the exact serving model and
+dimension explicitly:
+
+```sh
+python reindex.py \
+  --canon /srv/secretary-data/memory/facts \
+  --export /srv/secretary-data/memory/export.ndjson \
+  --target-db /srv/secretary-data/memory/index.sqlite \
+  --model intfloat/multilingual-e5-large \
+  --dim 1024
+```
+
+The command emits one JSON object. Its `parity` field reports the expected and
+indexed fact counts; a failure emits JSON, exits nonzero, and leaves the prior
+target database in place. The export is preferred when present; otherwise the
+canon must be a git worktree and its committed `HEAD` is used.
+
+The rebuilt database records its model and dimension. Before serving a retained
+index after a failed bootstrap, the daemon checks that metadata against
+`MEMORY_MODEL` and `MEMORY_DIM`; a mismatch remains not ready instead of failing
+vector searches later.
+
+An empty snapshot is rejected so a truncated restore cannot silently publish an
+empty index. If an empty canon is intentional, add `--allow-empty`.
+
+Run this only while `memory-mcp` is stopped. The daemon watcher and an offline
+rebuild must never write the same target database concurrently. Start the daemon
+after a successful rebuild so it uses the configured model and resumes its normal
+watch behavior.
 
 Rollback to the old readonly `panelmem-kb` canon is one setting:
 
