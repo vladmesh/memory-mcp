@@ -467,14 +467,16 @@ def index_metadata(path: str | Path) -> dict[str, str]:
     return {key: value for key, value in rows}
 
 
-def index_compatibility_error(path: str | Path, model: str, dim: int) -> str | None:
+def index_compatibility(path: str | Path, model: str, dim: int) -> tuple[str, str | None]:
     metadata = index_metadata(path)
+    if not metadata:
+        return "legacy", None
     if metadata.get("model") != model or metadata.get("dimension") != str(dim):
-        return (
+        return "mismatch", (
             f"index metadata mismatch: expected model={model!r} dimension={dim}, "
             f"got model={metadata.get('model')!r} dimension={metadata.get('dimension')!r}"
         )
-    return None
+    return "compatible", None
 
 
 def offline_rebuild(
@@ -540,19 +542,21 @@ def bootstrap_index() -> int | None:
     try:
         n = rebuild_index()
     except Exception as e:
-        compatibility_error = index_compatibility_error(DB_PATH, MODEL, DIM) if index_exists() else None
-        if index_exists() and compatibility_error is None:
+        has_index = index_exists()
+        status, detail = index_compatibility(DB_PATH, MODEL, DIM) if has_index else ("missing", None)
+        if has_index and status != "mismatch":
             mark_search_ready(e)
             print(f"memory-mcp: rebuild failed, keeping previous index: {e}", flush=True)
             return None
-        error = RuntimeError(compatibility_error) if compatibility_error else e
+        error = RuntimeError(detail) if detail else e
         mark_search_not_ready(error)
         print(f"memory-mcp: rebuild failed, no compatible index available: {error}", flush=True)
         return None
-    compatibility_error = index_compatibility_error(DB_PATH, MODEL, DIM)
-    if compatibility_error:
-        mark_search_not_ready(RuntimeError(compatibility_error))
-        print(f"memory-mcp: rebuilt index is incompatible: {compatibility_error}", flush=True)
+    status, detail = index_compatibility(DB_PATH, MODEL, DIM)
+    if status != "compatible":
+        error = detail or "rebuilt index has no metadata"
+        mark_search_not_ready(RuntimeError(error))
+        print(f"memory-mcp: rebuilt index is incompatible: {error}", flush=True)
         return None
     mark_search_ready()
     return n

@@ -184,6 +184,36 @@ def run_metadata_mismatch_stays_not_ready() -> None:
         server.rebuild_index = original_rebuild
 
 
+def run_legacy_index_stays_ready_after_failed_rebuild() -> None:
+    legacy_db = TMP / "legacy-index.sqlite"
+    conn = server.db(legacy_db)
+    conn.execute(
+        "CREATE TABLE memories(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
+        "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
+    )
+    conn.execute("CREATE VIRTUAL TABLE vec_memories USING vec0(embedding float[4])")
+    cur = conn.execute("INSERT INTO memories(text) VALUES (?)", ("legacy alpha fact",))
+    conn.execute(
+        "INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)",
+        (cur.lastrowid, server.sqlite_vec.serialize_float32(fake_vec("legacy alpha fact").tolist())),
+    )
+    conn.commit()
+    conn.close()
+
+    original_db = server.DB_PATH
+    original_rebuild = server.rebuild_index
+    server.DB_PATH = str(legacy_db)
+    server.rebuild_index = lambda: (_ for _ in ()).throw(RuntimeError("forced rebuild failure"))
+    try:
+        assert_true(server.index_metadata(legacy_db) == {}, "legacy test index unexpectedly has metadata")
+        assert_true(server.bootstrap_index() is None and server.search_ready(), "legacy index was not retained")
+        hit = server.memory_search("legacy alpha", k=1, caller="selftest")[0]
+        assert_true(hit["text"] == "legacy alpha fact", "legacy index no longer serves search")
+    finally:
+        server.DB_PATH = original_db
+        server.rebuild_index = original_rebuild
+
+
 def run_readiness_checks() -> None:
     server.mark_search_not_ready()
     response = server.memory_search("openrouter api key", caller="worker")
@@ -233,6 +263,7 @@ try:
     run_failed_rebuild_preserves_index()
     run_empty_export_preserves_index()
     run_metadata_mismatch_stays_not_ready()
+    run_legacy_index_stays_ready_after_failed_rebuild()
     run_readiness_checks()
     run_git_fallback_checks()
 finally:
