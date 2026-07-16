@@ -87,14 +87,14 @@ def init_db(path: str | Path = DB_PATH) -> None:
     conn.close()
 
 
-def create_schema(conn: sqlite3.Connection) -> None:
+def create_schema(conn: sqlite3.Connection, dim: int = DIM) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS memories("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
         "scope TEXT, tags TEXT, source TEXT, created_at TEXT)"
     )
     conn.execute(
-        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{DIM}])"
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{dim}])"
     )
 
 
@@ -359,16 +359,18 @@ def load_git_head_snapshot(path: Path) -> list[dict]:
     return facts
 
 
-def load_canon_entries() -> list[dict]:
-    if CANON_EXPORT.is_file():
-        return load_export_snapshot(CANON_EXPORT)
-    if not CANON.is_dir():
+def load_canon_entries(canon: Path | None = None, export: Path | None = None) -> list[dict]:
+    canon = canon or CANON
+    export = export or CANON_EXPORT
+    if export.is_file():
+        return load_export_snapshot(export)
+    if not canon.is_dir():
         return []
-    return load_git_head_snapshot(CANON)
+    return load_git_head_snapshot(canon)
 
 
-def load_canon() -> list:
-    return filter_current_facts(load_canon_entries())
+def load_canon(canon: Path | None = None, export: Path | None = None) -> list:
+    return filter_current_facts(load_canon_entries(canon, export))
 
 
 def canon_signature() -> tuple:
@@ -390,11 +392,19 @@ def canon_signature() -> tuple:
     raise RuntimeError(f"canon snapshot unavailable: no {CANON_EXPORT} and {CANON} is not in git")
 
 
-def rebuild_index() -> int:
-    """Rebuild memories + vec_memories from the canon and publish atomically."""
-    facts = load_canon()
-    rows = [(f, embed_doc(f["text"])) for f in facts]  # slow part, no lock held
-    target = Path(DB_PATH)
+def build_document_embedder(model: str):
+    """Return a normalized document embedder for an explicit model."""
+    embedding_model = TextEmbedding(model_name=model)
+
+    def embed(text: str) -> np.ndarray:
+        return _unit(list(embedding_model.embed([text]))[0])
+
+    return embed
+
+
+def write_index(facts: list[dict], target: Path, dim: int, document_embed) -> int:
+    """Write a complete index to a temporary file, then atomically publish it."""
+    rows = [(fact, document_embed(fact["text"])) for fact in facts]
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     os.close(fd)
@@ -402,7 +412,7 @@ def rebuild_index() -> int:
     tmp.unlink(missing_ok=True)
     try:
         conn = db(tmp)
-        create_schema(conn)
+        create_schema(conn, dim)
         for f, vec in rows:
             cur = conn.execute(
                 "INSERT INTO memories(text, scope, tags, source, created_at) VALUES (?,?,?,?,?)",
@@ -420,6 +430,48 @@ def rebuild_index() -> int:
         tmp.unlink(missing_ok=True)
         raise
     return len(rows)
+
+
+def offline_rebuild(
+    canon: str | Path,
+    export: str | Path,
+    target_db: str | Path,
+    model: str,
+    dim: int,
+    document_embed=None,
+) -> dict:
+    """Build and atomically publish an index from an explicit canon snapshot.
+
+    ``document_embed`` is an injection point for tests. Production callers omit it,
+    which loads the requested fastembed model.
+    """
+    canon_path = Path(canon)
+    export_path = Path(export)
+    target = Path(target_db)
+    if int(dim) <= 0:
+        raise ValueError(f"dimension must be positive: {dim}")
+    if not export_path.is_file() and not canon_path.is_dir():
+        raise RuntimeError(
+            f"canon snapshot unavailable: no export at {export_path} and no canon at {canon_path}"
+        )
+    facts = load_canon(canon_path, export_path)
+    document_embed = document_embed or build_document_embedder(model)
+    indexed = write_index(facts, target, int(dim), document_embed)
+    return {
+        "ok": indexed == len(facts),
+        "canon": str(canon_path),
+        "export": str(export_path),
+        "target_db": str(target),
+        "model": model,
+        "dimension": int(dim),
+        "parity": {"expected": len(facts), "indexed": indexed, "ok": indexed == len(facts)},
+    }
+
+
+def rebuild_index() -> int:
+    """Daemon rebuild using its configured canon, model, and target database."""
+    result = offline_rebuild(CANON, CANON_EXPORT, DB_PATH, MODEL, DIM, document_embed=embed_doc)
+    return result["parity"]["indexed"]
 
 
 def indexed_fact_count() -> int:

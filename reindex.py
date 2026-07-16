@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Manual fallback for rebuilding the sqlite index from the configured canon.
+"""Offline, atomic rebuild of a memory-mcp index from a canon snapshot."""
+import argparse
+import json
+from pathlib import Path
 
-In normal operation the daemon rebuilds its own index in-process (see
-server.rebuild_index + the canon watcher). This script is the offline path. Run it
-with the daemon stopped (single writer to the sqlite file) for a migration, a model/dim
-change, or to force a rebuild without the running daemon. Same logic, one implementation.
-"""
 import server
 
 
-def reindex() -> int:
-    server.embedder()
-    return server.rebuild_index()
+def rebuild(canon, export, target_db, model, dim, document_embed=None) -> dict:
+    """Public rebuild entry point. ``document_embed`` keeps tests model-free."""
+    return server.offline_rebuild(canon, export, target_db, model, dim, document_embed)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--canon", required=True, type=Path, help="markdown facts root")
+    parser.add_argument("--export", required=True, type=Path, help="published export.ndjson snapshot")
+    parser.add_argument("--target-db", required=True, type=Path, help="sqlite index to atomically replace")
+    parser.add_argument("--model", required=True, help="fastembed model id")
+    parser.add_argument("--dim", required=True, type=int, help="embedding vector dimension")
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    n = reindex()
-    parity = server.parity_gate()
-    print(
-        f"reindexed {n} facts from {server.CANON} into {server.DB_PATH} "
-        f"at dim={server.DIM} model={server.MODEL}"
-    )
-    print(
-        f"parity: expected={parity['expected']} indexed={parity['indexed']} "
-        f"ok={parity['ok']}"
-    )
+    try:
+        print(json.dumps(rebuild(**vars(parse_args())), ensure_ascii=False))
+    except Exception as error:
+        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        raise SystemExit(1)

@@ -119,14 +119,17 @@ def run_export_rebuild_checks() -> None:
         ]
     )
 
-    n = reindex.reindex()
-    assert_true(n == 3, f"expected 3 current facts, got {n}")
+    result = reindex.rebuild(CANON, EXPORT, DB, "selftest", 4, document_embed=fake_vec)
+    assert_true(result["parity"] == {"expected": 3, "indexed": 3, "ok": True}, f"bad rebuild result: {result}")
     parity = server.parity_gate()
     assert_true(parity == {"ok": True, "expected": 3, "indexed": 3}, f"bad parity: {parity}")
 
-    hit = server.search_memory("openrouter api key", k=1)[0]
+    server.mark_search_ready()
+    hit = server.memory_search("openrouter api key", k=1, caller="selftest")[0]
     assert_true("open_router_key" in hit["text"] and hit["scope"] == "global", "known fact search failed")
     rows = server.memory_list(limit=10)
+    fetched = server.memory_get(hit["id"])
+    assert_true(fetched["id"] == hit["id"] and fetched["text"] == hit["text"], "memory_get did not return search hit")
     text = "\n".join(row["text"] for row in rows)
     assert_true("old_port_marker" not in text, "superseded fact leaked into index")
     assert_true("deleted_marker" not in text, "deleted fact leaked into index")
@@ -186,8 +189,8 @@ def run_git_fallback_checks() -> None:
 
     path.write_text(fact("fallback", "dirty fallback fact should be ignored"), encoding="utf-8")
     configure(legacy_canon, legacy / "export.ndjson", legacy_db)
-    n = reindex.reindex()
-    assert_true(n == 1, f"fallback expected 1 fact, got {n}")
+    result = reindex.rebuild(legacy_canon, legacy / "export.ndjson", legacy_db, "selftest", 4, document_embed=fake_vec)
+    assert_true(result["parity"]["indexed"] == 1, f"fallback expected 1 fact, got {result}")
     hit = server.search_memory("fallback rollback", k=1)[0]["text"]
     assert_true("committed rollback" in hit and "dirty" not in hit, "fallback did not read committed HEAD")
 
