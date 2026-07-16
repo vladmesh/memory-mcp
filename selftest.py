@@ -152,6 +152,38 @@ def run_failed_rebuild_preserves_index() -> None:
     assert_true(before == after, "failed rebuild replaced the previous index")
 
 
+def run_empty_export_preserves_index() -> None:
+    before = server.search_memory("openrouter api key", k=1)[0]["text"]
+    write_export([])
+    try:
+        reindex.rebuild(CANON, EXPORT, DB, "selftest", 4, document_embed=fake_vec)
+    except RuntimeError as error:
+        assert_true("no current facts" in str(error), f"unexpected empty export error: {error}")
+    else:
+        raise AssertionError("empty export rebuild unexpectedly succeeded")
+    after = server.search_memory("openrouter api key", k=1)[0]["text"]
+    assert_true(before == after, "empty export replaced the previous index")
+
+
+def run_metadata_mismatch_stays_not_ready() -> None:
+    metadata = server.index_metadata(DB)
+    assert_true(metadata == {"model": "selftest", "dimension": "4"}, f"bad index metadata: {metadata}")
+    original_model = server.MODEL
+    original_rebuild = server.rebuild_index
+    server.MODEL = "configured-model"
+    server.rebuild_index = lambda: (_ for _ in ()).throw(RuntimeError("forced rebuild failure"))
+    try:
+        assert_true(server.bootstrap_index() is None and not server.search_ready(), "mismatched index became ready")
+        response = server.memory_search("openrouter api key", caller="selftest")
+        assert_true(
+            response["status"] == "not_ready" and "metadata mismatch" in response["detail"],
+            f"mismatch did not return an explicit not-ready response: {response}",
+        )
+    finally:
+        server.MODEL = original_model
+        server.rebuild_index = original_rebuild
+
+
 def run_readiness_checks() -> None:
     server.mark_search_not_ready()
     response = server.memory_search("openrouter api key", caller="worker")
@@ -199,6 +231,8 @@ try:
     configure(CANON, EXPORT, DB)
     run_export_rebuild_checks()
     run_failed_rebuild_preserves_index()
+    run_empty_export_preserves_index()
+    run_metadata_mismatch_stays_not_ready()
     run_readiness_checks()
     run_git_fallback_checks()
 finally:

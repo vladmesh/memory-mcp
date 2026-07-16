@@ -65,6 +65,14 @@ indexed fact counts; a failure emits JSON, exits nonzero, and leaves the prior
 target database in place. The export is preferred when present; otherwise the
 canon must be a git worktree and its committed `HEAD` is used.
 
+The rebuilt database records its model and dimension. Before serving a retained
+index after a failed bootstrap, the daemon checks that metadata against
+`MEMORY_MODEL` and `MEMORY_DIM`; a mismatch remains not ready instead of failing
+vector searches later.
+
+An empty snapshot is rejected so a truncated restore cannot silently publish an
+empty index. If an empty canon is intentional, add `--allow-empty`.
+
 Run this only while `memory-mcp` is stopped. The daemon watcher and an offline
 rebuild must never write the same target database concurrently. Start the daemon
 after a successful rebuild so it uses the configured model and resumes its normal

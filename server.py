@@ -87,7 +87,8 @@ def init_db(path: str | Path = DB_PATH) -> None:
     conn.close()
 
 
-def create_schema(conn: sqlite3.Connection, dim: int = DIM) -> None:
+def create_schema(conn: sqlite3.Connection, dim: int | None = None) -> None:
+    dim = DIM if dim is None else dim
     conn.execute(
         "CREATE TABLE IF NOT EXISTS memories("
         "id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, "
@@ -95,6 +96,9 @@ def create_schema(conn: sqlite3.Connection, dim: int = DIM) -> None:
     )
     conn.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[{dim}])"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS index_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
     )
 
 
@@ -402,7 +406,17 @@ def build_document_embedder(model: str):
     return embed
 
 
-def write_index(facts: list[dict], target: Path, dim: int, document_embed) -> int:
+def indexed_fact_count(path: str | Path = DB_PATH) -> int:
+    path = Path(path)
+    if not path.is_file():
+        return 0
+    conn = db(path)
+    count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+    conn.close()
+    return count
+
+
+def write_index(facts: list[dict], target: Path, model: str, dim: int, document_embed) -> int:
     """Write a complete index to a temporary file, then atomically publish it."""
     rows = [(fact, document_embed(fact["text"])) for fact in facts]
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -413,6 +427,10 @@ def write_index(facts: list[dict], target: Path, dim: int, document_embed) -> in
     try:
         conn = db(tmp)
         create_schema(conn, dim)
+        conn.executemany(
+            "INSERT INTO index_metadata(key, value) VALUES (?, ?)",
+            [("model", model), ("dimension", str(dim))],
+        )
         for f, vec in rows:
             cur = conn.execute(
                 "INSERT INTO memories(text, scope, tags, source, created_at) VALUES (?,?,?,?,?)",
@@ -424,12 +442,39 @@ def write_index(facts: list[dict], target: Path, dim: int, document_embed) -> in
             )
         conn.commit()
         conn.close()
+        indexed = indexed_fact_count(tmp)
+        if indexed != len(facts):
+            raise RuntimeError(f"index parity failed before publish: expected {len(facts)}, got {indexed}")
         with _reindex_lock:
             os.replace(tmp, target)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
-    return len(rows)
+    return indexed_fact_count(target)
+
+
+def index_metadata(path: str | Path) -> dict[str, str]:
+    path = Path(path)
+    if not path.is_file():
+        return {}
+    conn = db(path)
+    try:
+        rows = conn.execute("SELECT key, value FROM index_metadata").fetchall()
+    except sqlite3.OperationalError:
+        rows = []
+    finally:
+        conn.close()
+    return {key: value for key, value in rows}
+
+
+def index_compatibility_error(path: str | Path, model: str, dim: int) -> str | None:
+    metadata = index_metadata(path)
+    if metadata.get("model") != model or metadata.get("dimension") != str(dim):
+        return (
+            f"index metadata mismatch: expected model={model!r} dimension={dim}, "
+            f"got model={metadata.get('model')!r} dimension={metadata.get('dimension')!r}"
+        )
+    return None
 
 
 def offline_rebuild(
@@ -439,6 +484,7 @@ def offline_rebuild(
     model: str,
     dim: int,
     document_embed=None,
+    allow_empty: bool = False,
 ) -> dict:
     """Build and atomically publish an index from an explicit canon snapshot.
 
@@ -455,38 +501,35 @@ def offline_rebuild(
             f"canon snapshot unavailable: no export at {export_path} and no canon at {canon_path}"
         )
     facts = load_canon(canon_path, export_path)
+    if not facts and not allow_empty:
+        raise RuntimeError("canon snapshot has no current facts; pass allow_empty=True to publish an empty index")
     document_embed = document_embed or build_document_embedder(model)
-    indexed = write_index(facts, target, int(dim), document_embed)
+    indexed = write_index(facts, target, model, int(dim), document_embed)
+    parity = {"expected": len(facts), "indexed": indexed, "ok": indexed == len(facts)}
+    if not parity["ok"]:
+        raise RuntimeError(f"index parity failed after publish: expected {len(facts)}, got {indexed}")
     return {
-        "ok": indexed == len(facts),
+        "ok": parity["ok"],
         "canon": str(canon_path),
         "export": str(export_path),
         "target_db": str(target),
         "model": model,
         "dimension": int(dim),
-        "parity": {"expected": len(facts), "indexed": indexed, "ok": indexed == len(facts)},
+        "parity": parity,
     }
 
 
 def rebuild_index() -> int:
     """Daemon rebuild using its configured canon, model, and target database."""
-    result = offline_rebuild(CANON, CANON_EXPORT, DB_PATH, MODEL, DIM, document_embed=embed_doc)
+    result = offline_rebuild(
+        CANON, CANON_EXPORT, DB_PATH, MODEL, DIM, document_embed=embed_doc, allow_empty=True
+    )
     return result["parity"]["indexed"]
-
-
-def indexed_fact_count() -> int:
-    if not index_exists():
-        return 0
-    with _reindex_lock:
-        conn = db()
-        count = conn.execute("SELECT count(*) FROM memories").fetchone()[0]
-        conn.close()
-    return count
 
 
 def parity_gate() -> dict:
     expected = len(load_canon())
-    indexed = indexed_fact_count()
+    indexed = indexed_fact_count(DB_PATH)
     return {"ok": expected == indexed, "expected": expected, "indexed": indexed}
 
 
@@ -497,12 +540,19 @@ def bootstrap_index() -> int | None:
     try:
         n = rebuild_index()
     except Exception as e:
-        if index_exists():
+        compatibility_error = index_compatibility_error(DB_PATH, MODEL, DIM) if index_exists() else None
+        if index_exists() and compatibility_error is None:
             mark_search_ready(e)
             print(f"memory-mcp: rebuild failed, keeping previous index: {e}", flush=True)
             return None
-        mark_search_not_ready(e)
-        print(f"memory-mcp: rebuild failed, no index available: {e}", flush=True)
+        error = RuntimeError(compatibility_error) if compatibility_error else e
+        mark_search_not_ready(error)
+        print(f"memory-mcp: rebuild failed, no compatible index available: {error}", flush=True)
+        return None
+    compatibility_error = index_compatibility_error(DB_PATH, MODEL, DIM)
+    if compatibility_error:
+        mark_search_not_ready(RuntimeError(compatibility_error))
+        print(f"memory-mcp: rebuilt index is incompatible: {compatibility_error}", flush=True)
         return None
     mark_search_ready()
     return n
